@@ -1,0 +1,11 @@
+[package]
+name = "audio_scripting"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+cpal = "0.16.0"
+dasp = { version = "0.11.0", features = ["all"] }
+find_folder = "0.3.0"
+hound = "3.5.1"
