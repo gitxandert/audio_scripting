@@ -1,9 +1,10 @@
 use std::thread;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::collections;:HashMap;
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
 
 use crossbeam_channel::{unbounded, Sender, Receiver};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::platform::{Host, Device};
 
 use hound::{SampleFormat, WavReader};
@@ -15,9 +16,10 @@ pub mod audio_setup {
         use super::*;
 
         pub struct CpalDevice {
-            host: Host,
-            device: Device,
-            cfg: cpal::StreamConfig,
+            pub host: Host,
+            pub device: Device,
+            pub cfg: cpal::StreamConfig,
+            pub sample_rate: usize,
         }
 
         impl CpalDevice {
@@ -26,21 +28,62 @@ pub mod audio_setup {
                 let device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("no output device"))?;
                 let out_cfg = device.default_output_config()?;
                 let cfg: cpal::StreamConfig = out_cfg.clone().into();
-
-                Ok(Arc::new(Self { host, device, cfg }))
+                let sample_rate = cfg.sample_rate.0;
+                let sample_rate: usize = sample_rate.try_into().unwrap();
+                Ok(
+                    Arc::new(
+                        Self { 
+                            host, device, cfg, sample_rate 
+                        }))
             }
         }
     } // end pub mod device
+
+    pub mod engine {
+        use super::*;
+
+        pub struct Engine {
+            pub tracks: HashMap<String, Arc<TrackState>>,
+            pub cmd_rx: Receiver<Command>,
+        }
+
+        impl Engine {
+            pub fn new(cmd_rx: Receiver<Command>) -> Self {
+                let mut tracks: Hashmap<String, Arc<TrackState>> = HashMap::new();
+
+                Self {
+                    tracks,
+                    cmd_rx,
+                }
+            }
+            //
+            // pub fn run(cmd: Command) {
+            //   match cmd.target {
+            //      "Track" => {
+            //          TODO : start producer thread to fill up buffer
+            //      }
+            //   }   
+            // 
+        }
+
+        pub struct TrackState {
+            pub name: String,
+            pub buffer_producer: ringbuf::Producer<f32>,
+            pub buffer_consumer: ringbuf::Consumer<f32>,
+            pub active: AtomicBool,
+            pub position: AtomicUsize,
+        }
+    } // end pub mod engine
 
     pub mod tracks {
         use super::*;
 
         pub struct Track {
-            path: String,
-            in_ch: usize,
-            data: Arc<Vec<f32>>, 
-            pos: Arc<AtomicUsize>,
-            total_frames: usize,
+            pub path: String,
+            pub channels: usize,
+            pub data: Vec<f32>,
+            pub total_frames: usize,
+            pub sample_rate: usize,
         }
 
         fn decode_to_f32(path: &str) -> anyhow::Result<(Vec<f32>, hound::WavSpec)> {
@@ -60,35 +103,80 @@ pub mod audio_setup {
         }
 
         impl Track {
-            pub fn new(path: &str) -> anyhow::Result<Arc<Self>> {
+            fn resample_to_device_rate(track: &Track, out_rate: usize) -> Vec<f32> {
+                if track.sample_rate == out_rate {
+                    return track.data.clone();
+                }
+
+                println!("Resampling {}", track.path);
+
+                let nch = track.channels;
+                let input: Vec<Vec<f32>> = (0..nch)
+                    .map(|ch| track.data.iter().skip(ch).step_by(nch).copied().collect())
+                    .collect();
+
+                let mut resampler = FftFixedIn::<f32>::new(
+                    track.sample_rate, out_rate, 1024, 1, nch
+                ).unwrap();
+
+                let mut out_chs: Vec<Vec<f32>> = (0..nch).map(|_| Vec::new()).collect();
+
+                let mut pos = 0;
+                while pos < input[0].len() {
+                    let frames = resampler.input_frames_next();
+                    let end = (pos + frames).min(input[0].len());
+                    let chunk: Vec<Vec<f32>> = (0..nch)
+                        .map(|ch| input[ch][pos..end].to_vec())
+                        .collect();
+                    let output = resampler.process(&chunk, None).unwrap();
+                    for (ch, buf) in output.into_iter().enumerate() {
+                        out_chs[ch].extend(buf);
+                    }
+                    pos = end;
+                }
+                // interleave
+                let frames = out_chs[0].len();
+                let mut interleaved = Vec::with_capacity(frames * nch);
+                for f in 0..frames {
+                    for c in 0..nch {
+                        interleaved.push(out_chs[c][f]);
+                    }
+                }
+
+                interleaved
+            }
+
+            pub fn new(path: &str, out_rate: usize) -> anyhow::Result<Arc<Self>> {
                 println!("Loading {path}...");
                 // Decode
                 let (mut data, spec) = decode_to_f32(path)?;
-                let in_ch = spec.channels as usize;
+                let channels = spec.channels as usize;
+                let sample_rate = spec.sample_rate as usize;
 
-                // Share buffers
-                let data = Arc::new(data);
-                let pos  = Arc::new(AtomicUsize::new(0)); // index in *frames* (not samples)
+                if sample_rate != out_rate {
+                    data = resample_to_device_rate(&track, out_rate);
 
                 // Compute total frames in the source
-                let total_frames = data.len() / in_ch;
+                let total_frames = data.len() / channels;
  
                 println!("Finished loading {path}");
                 Ok(Arc::new(Self { 
                     path: path.to_string(), 
-                    in_ch, 
+                    channels, 
                     data, 
-                    pos, 
-                    total_frames 
+                    total_frames,
+                    sample_rate,
                 }))
             }
         }
+
     } // end pub mod tracks
 } // end mod audio_setup
 
 // re-export
 pub use crate::audio_setup::{
     device::CpalDevice,
+    engine::{Engine, TrackState},
     tracks::Track
 };
 
