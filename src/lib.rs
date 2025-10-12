@@ -1,6 +1,11 @@
 use std::thread;
 use std::collections;:HashMap;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
+use std::sync::{
+    Arc, 
+    atomic::{AtomicBool, AtomicUsize, Ordering}
+};
+
+use ringbuf::RingBuffer;
 
 use crossbeam_channel::{unbounded, Sender, Receiver};
 
@@ -43,35 +48,46 @@ pub mod audio_setup {
         use super::*;
 
         pub struct Engine {
-            pub tracks: HashMap<String, Arc<TrackState>>,
-            pub cmd_rx: Receiver<Command>,
+            pub buffers: Vec<Arc<Buffer>>,
+            pub channels: u32,
         }
 
         impl Engine {
-            pub fn new(cmd_rx: Receiver<Command>) -> Self {
-                let mut tracks: Hashmap<String, Arc<TrackState>> = HashMap::new();
+            pub fn new(channels: u32) -> Self {
+                let buffers: Vec<Arc<Buffer> = Vec::new();
 
-                Self {
-                    tracks,
-                    cmd_rx,
+                Self { buffers, channels }
+            }
+
+            pub fn process(&self, output: &mut [f32]) {
+                for buf in &self.buffers {
+                    if buf.active.load(Ordering::Relaxed) {
+                        buf.mix_into(output, channels);
+                        buf.active.store(false, Ordering::Relaxed);
+                    }
                 }
             }
-            //
-            // pub fn run(cmd: Command) {
-            //   match cmd.target {
-            //      "Track" => {
-            //          TODO : start producer thread to fill up buffer
-            //      }
-            //   }   
-            // 
         }
 
-        pub struct TrackState {
-            pub name: String,
-            pub buffer_producer: ringbuf::Producer<f32>,
-            pub buffer_consumer: ringbuf::Consumer<f32>,
+        pub struct Buffer {
+            pub ring: ringbuf::Consumer<f32>,
+            // ringbuf::Producer sent to Worker thread
             pub active: AtomicBool,
-            pub position: AtomicUsize,
+            pub gain: f32,
+        }
+
+        impl Buffer {
+            pub fn mix_into(&self, output: &mut [f32], channels) {
+                let mut tmp = [0.0f32; 4096];
+                let n = self.ring.pop_slice(&mut tmp[..output.len() / channels]);
+                for i in 0..n {
+                    for ch in 0..channels {
+                        output[i * channels + ch] += tmp[i] * self.gain;
+                }
+                if n == 0 {
+                    self.active.store(false, Ordering::Relaxed);
+                }
+            }
         }
     } // end pub mod engine
 
@@ -249,3 +265,15 @@ pub mod concurrency {
 
 // re-export
 pub use crate::concurrency::threadpool::ThreadPool;
+
+pub mod command {
+    enum Command {
+        Start(String),
+        Stop(String),
+        // SetGain { track: String, level: f32 },
+        // there will be many more
+    }
+}
+
+// re-export
+pub use crate::command::Command;

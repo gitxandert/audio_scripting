@@ -2,9 +2,12 @@ use std::io;
 use std::thread;
 use std::path::Path;
 use std::fs::{self, DirEntry};
-use std::sync::{mpsc, Arc, atomic::{Ordering, AtomicUsize}};
+use std::sync::{
+    mpsc, Arc, 
+    atomic::{Ordering, AtomicBool, AtomicUsize}
+};
 
-use audio_scripting::{CpalDevice, Engine, TrackData, TrackState, ThreadPool};
+use audio_scripting::{CpalDevice, Engine, Track, TrackState, ThreadPool};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -17,10 +20,8 @@ fn CPAL_init() -> anyhow::Result<Arc<CpalDevice>> {
     Ok(cdev)
 }
 
-fn start_engine() -> anyhow::Result<Engine> {
-    let engine = Engine::new();
-
-    Ok(engine)
+fn engine_init(channels: u32) -> anyhow::Result<Arc<Engine>> {
+    Ok(Arc::new(Engine::new(channels)))
 }
 
 fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
@@ -58,62 +59,19 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
     Ok(tracks)
 }
 
-/* updating with real time version
- * fn stream_audio(tracks: Vec<Arc<Track>>, cdev: Arc<CpalDevice>) -> anyhow::Result<()> {
-    let cfg = Arc::new(cdev.cfg.clone()); 
-    let cfg_cb = Arc::clone(&cfg);
+fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()> {
+    let cfg = cdev.cfg.clone(); 
     let out_ch = cfg.channels as usize;  
-    
-    let tracks = Arc::new(tracks);
-    let tracks_cb = Arc::clone(&tracks);
+
+    // clone to move into CPAL callback
+    let engine_cb = Arc::clone(&engine);
 
     let stream = cdev.device.build_output_stream::<f32, _, _>(
         &cfg,
-        move |out: &mut [f32], _| {
-            // out is interleaved: frames * out_ch
-            let frames_out = out.len() / out_ch;
-
-            for s in out.iter_mut() {
-                *s = 0.0;
+        move |data: &mut [f32], _| {
+            for frame in data.chunks_mut(out_ch) {
+                engine_cb.process(frame);
             }
-
-            for track in tracks_cb.iter() {
-                let pos = track.position.load(Ordering::Relaxed);
-                let in_ch = track.channels;
-                let total = track.total_frames;
-                
-                if pos >= total {
-                    continue; // finished track
-                }
-
-                let mut frames_mixed = 0;
-                for frame_idx in 0..frames_out {
-                    let f = pos + frame_idx;
-                    if f >= total {
-                        break; // end of track
-                    }
-
-                    for c in 0..out_ch {
-                        let sample = if c < in_ch && f * in_ch + c < track.data.len() {
-                            track.data[f * in_ch + c]
-                        } else {
-                            0.0
-                        };
-                        out[frame_idx * out_ch + c] += sample;
-                    }
-                    frames_mixed += 1;
-                }
-
-                // advance track playback
-                track
-                    .position
-                    .fetch_add(frames_mixed, Ordering::Relaxed);
-            }
-
-            // soft clipping to prevent overflow
-            //for s in out.iter_mut() {
-              //  *s = s.clamp(-1.0, 1.0);
-            //}
         },
         |err| eprintln!("Stream error: {err}"),
         None,
@@ -121,32 +79,43 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
 
     stream.play()?;
 
-    // Keep running while any track still has data left
     loop {
-        let done = tracks
-            .iter()
-            .all(|t| t.position.load(Ordering::Relaxed) >= t.total_frames);
-        if done {
+        print!("> ");
+        io::stdout().flush().unwrap();
+        let mut cmd = String::new();
+
+        io::stdin()
+            .read_line(&mut cmd)
+            .expect("Failed to read line");
+        let cmd = cmd.trim();
+
+        if cmd == "quit" {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        
+        if let Some(command) = match_cmd(cmd) {
+            spawn_worker(command, Arc::clone(&engine);
+        } else {
+            println!("Unrecognized command: {cmd}");
+        };
     }
 
     Ok(())
 }
-*/
+
 
 fn main() -> anyhow::Result<()> {
     let device = CPAL_init()?;
     println!("Successfully initialized device.");
 
+    let channels = 2;
+    let engine = engine_init(channels)?;
+    println!("Initialized engine.");
+    
     let tracks = load_tracks(device.sample_rate)?; 
     println!("Loaded all tracks.");
-
-    let engine = start_engine()?;
-    println!("Started engine.");
-
-    //  stream_audio(tracks, device);
+    // TODO: integrate tracks into stream_audio
+    //  stream_audio(engine, device);
 
     Ok(())
 }
