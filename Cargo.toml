@@ -9,3 +9,4 @@ cpal = "0.16.0"
 crossbeam-channel = "0.5.15"
 dasp = { version = "0.11.0", features = ["all"] }
 hound = "3.5.1"
+rubato = "0.16.2"
