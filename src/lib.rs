@@ -1,7 +1,7 @@
 use std::thread;
-use std::collections;:HashMap;
 use std::sync::{
     Arc, 
+    RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering}
 };
 
@@ -62,7 +62,7 @@ pub mod audio_setup {
             pub fn process(&self, output: &mut [f32]) {
                 for buf in &self.buffers {
                     if buf.active.load(Ordering::Relaxed) {
-                        buf.mix_into(output, channels);
+                        buf.mix_into(output, self.channels);
                         buf.active.store(false, Ordering::Relaxed);
                     }
                 }
@@ -77,13 +77,23 @@ pub mod audio_setup {
         }
 
         impl Buffer {
+            pub new(ring: ringbuf::Consumer<f32>) -> Self {
+                Self {
+                    ring,
+                    active: AtomicBool::new(true),
+                    gain: 1.0f32
+                }
+            }
+
             pub fn mix_into(&self, output: &mut [f32], channels) {
                 let mut tmp = [0.0f32; 4096];
                 let n = self.ring.pop_slice(&mut tmp[..output.len() / channels]);
                 for i in 0..n {
                     for ch in 0..channels {
                         output[i * channels + ch] += tmp[i] * self.gain;
+                    }
                 }
+
                 if n == 0 {
                     self.active.store(false, Ordering::Relaxed);
                 }
@@ -266,14 +276,73 @@ pub mod concurrency {
 // re-export
 pub use crate::concurrency::threadpool::ThreadPool;
 
+// Commands
+//
+use std::sync::RwLock;
+use std::collections::HashMap;
+
+// consistent match statement expansion
+macro_rules! cmd_trie {
+    ($($key:literal => $handler:path),* $(,)?) => {{
+        fn lookup<'a>(cmd: &str) -> Option<fn(&'a str) -> Command> {
+            match cmd {
+                $($key => Some($handler),)*
+                _ => None,
+            }
+         /* prefix matching:
+          * $(
+          *      if $key.starts_with(cmd) {
+          *          return Some($handler);
+          *      }
+          *  )*
+          *  None
+          */
+        }
+        lookup
+    }};
+}
+
+static CORE_CMDS: fn(&str) -> Option<fn(&str) -> Command> = cmd_trie! {
+    "start" => Command::Play(args),
+    "stop" => Command::Stop(args),
+};
+
+lazy_static::lazy_static! {
+    static ref EXT_CMDS: RwLock<HashMap<String, fn(&str) -> Command>> = RwLock::new(HashMap::new());
+}
+
 pub mod command {
+    use super::*;
+
     enum Command {
-        Start(String),
-        Stop(String),
-        // SetGain { track: String, level: f32 },
-        // there will be many more
+        Play(args),
+        Stop(args),
+        // etc.
+    }
+
+    // user will be able to feed their own commands in at run time
+    pub fn register_command(name: &str, handler: fn(&str) -> Command) {
+        EXT_CMDS.write().unwrap().insert(name.to_string(), handler);
+    }
+
+    pub fn match_cmd(line:&str) -> Option<Command> {
+        let mut parts = line.splitn(2, ' ');
+        let cmd_name = parts.next()?;
+        let args = parts.next().unwrap_or("");
+
+        // check compile-time core commands first
+        if let Some(ctor) = CORE_CMDS(cmd_name) {
+            return Some(ctor(args));
+        }
+
+        // fall back to dynamically-registered commands
+        if let Some(ctor) = EXT_CMDS.read().unwrap().get(cmd_name) {
+            return Some(ctor(args));
+        }
+
+        None
     }
 }
 
 // re-export
-pub use crate::command::Command;
+pub use crate::command::{self, Command};
