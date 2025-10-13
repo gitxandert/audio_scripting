@@ -282,9 +282,9 @@ use std::sync::RwLock;
 use std::collections::HashMap;
 
 // consistent match statement expansion
-macro_rules! cmd_trie {
+macro_rules! cmd_table {
     ($($key:literal => $handler:path),* $(,)?) => {{
-        fn lookup<'a>(cmd: &str) -> Option<fn(&'a str) -> Command> {
+        fn lookup<'a>(cmd: &str) -> Option<fn(&'a str, Arc<Engine>) -> Command> {
             match cmd {
                 $($key => Some($handler),)*
                 _ => None,
@@ -302,9 +302,9 @@ macro_rules! cmd_trie {
     }};
 }
 
-static CORE_CMDS: fn(&str) -> Option<fn(&str) -> Command> = cmd_trie! {
-    "start" => Command::Play(args),
-    "stop" => Command::Stop(args),
+static CORE_CMDS: fn(&str) -> Option<fn(&str, Arc<Enginge>) -> Command> = cmd_table! {
+    "start" => Command::Play(),
+    "stop" => Command::Stop(),
 };
 
 lazy_static::lazy_static! {
@@ -320,24 +320,27 @@ pub mod command {
         // etc.
     }
 
+    impl Job for Command {
+    }
+
     // user will be able to feed their own commands in at run time
     pub fn register_command(name: &str, handler: fn(&str) -> Command) {
         EXT_CMDS.write().unwrap().insert(name.to_string(), handler);
     }
 
-    pub fn match_cmd(line:&str) -> Option<Command> {
+    pub fn match_cmd(line:&str, engine: Arc<Engine>) -> Option<Command> {
         let mut parts = line.splitn(2, ' ');
         let cmd_name = parts.next()?;
         let args = parts.next().unwrap_or("");
 
         // check compile-time core commands first
         if let Some(ctor) = CORE_CMDS(cmd_name) {
-            return Some(ctor(args));
+            return Some(ctor(args, engine));
         }
 
         // fall back to dynamically-registered commands
         if let Some(ctor) = EXT_CMDS.read().unwrap().get(cmd_name) {
-            return Some(ctor(args));
+            return Some(ctor(args, engine));
         }
 
         None
