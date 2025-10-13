@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{Ordering, AtomicBool, AtomicUsize}
 };
 
-use audio_scripting::{CpalDevice, Engine, Track, TrackState, ThreadPool};
+use audio_scripting::{CpalDevice, Engine, Track, TrackState, ThreadPool, Command};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -59,6 +59,14 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
     Ok(tracks)
 }
 
+fn spawn_worker(cmd: &str, engine: Arc<Engine>) {
+    let worker = thread::spawn(move ||
+        if let Some(cmd) = match_cmd(command, engine) {
+            cmd();
+        });
+    }
+}
+
 fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()> {
     let cfg = cdev.cfg.clone(); 
     let out_ch = cfg.channels as usize;  
@@ -93,11 +101,7 @@ fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()
             break;
         }
         
-        if let Some(command) = match_cmd(cmd) {
-            spawn_worker(command, Arc::clone(&engine);
-        } else {
-            println!("Unrecognized command: {cmd}");
-        };
+        spawn_worker(command, Arc::clone(&engine));
     }
 
     Ok(())

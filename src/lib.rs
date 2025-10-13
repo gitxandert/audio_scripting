@@ -345,4 +345,4 @@ pub mod command {
 }
 
 // re-export
-pub use crate::command::{self, Command};
+pub use crate::command::{match_cmd, Command};
