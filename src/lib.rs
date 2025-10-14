@@ -1,4 +1,5 @@
 use std::thread;
+use std::collections::HashMap;
 use std::sync::{
     Arc, 
     RwLock,
@@ -48,13 +49,13 @@ pub mod audio_setup {
         use super::*;
 
         pub struct Engine {
-            pub buffers: Vec<Arc<Buffer>>,
+            pub buffers: HashMap<&'static str, Arc<Buffer>>,
             pub channels: u32,
         }
 
         impl Engine {
             pub fn new(channels: u32) -> Self {
-                let buffers: Vec<Arc<Buffer> = Vec::new();
+                let buffers: HashMap<&'static str, Arc<Buffer>> = HashMap::new();
 
                 Self { buffers, channels }
             }
@@ -279,12 +280,11 @@ pub use crate::concurrency::threadpool::ThreadPool;
 // Commands
 //
 use std::sync::RwLock;
-use std::collections::HashMap;
 
 // consistent match statement expansion
 macro_rules! cmd_table {
     ($($key:literal => $handler:path),* $(,)?) => {{
-        fn lookup<'a>(cmd: &str) -> Option<fn(&'a str, Arc<Engine>) -> Command> {
+        fn lookup<'a>(cmd: &str) -> Option<fn(&str)> {
             match cmd {
                 $($key => Some($handler),)*
                 _ => None,
@@ -302,45 +302,36 @@ macro_rules! cmd_table {
     }};
 }
 
-static CORE_CMDS: fn(&str) -> Option<fn(&str, Arc<Enginge>) -> Command> = cmd_table! {
-    "start" => Command::Play(),
-    "stop" => Command::Stop(),
+static CORE_CMDS: fn(&str) -> Option<fn(&str)> = cmd_table! {
+    "start" => Engine::Play,
+    "stop" => Engine::Stop,
 };
 
 lazy_static::lazy_static! {
-    static ref EXT_CMDS: RwLock<HashMap<String, fn(&str) -> Command>> = RwLock::new(HashMap::new());
+    static ref EXT_CMDS: RwLock<HashMap<String, fn(&str)> = RwLock::new(HashMap::new());
 }
 
 pub mod command {
     use super::*;
 
-    enum Command {
-        Play(args),
-        Stop(args),
-        // etc.
-    }
-
-    impl Job for Command {
-    }
-
-    // user will be able to feed their own commands in at run time
-    pub fn register_command(name: &str, handler: fn(&str) -> Command) {
+    // user will be able to load their own commands at run time
+    pub fn register_command(name: &str, handler: fn(&str)) {
         EXT_CMDS.write().unwrap().insert(name.to_string(), handler);
     }
 
-    pub fn match_cmd(line:&str, engine: Arc<Engine>) -> Option<Command> {
+    pub fn match_cmd(line: &str) -> Option<fn(&str), &str> {
         let mut parts = line.splitn(2, ' ');
         let cmd_name = parts.next()?;
         let args = parts.next().unwrap_or("");
 
         // check compile-time core commands first
-        if let Some(ctor) = CORE_CMDS(cmd_name) {
-            return Some(ctor(args, engine));
+        if let Some(ctor, args) = CORE_CMDS(cmd_name) {
+            return Some(ctor, args);
         }
 
         // fall back to dynamically-registered commands
-        if let Some(ctor) = EXT_CMDS.read().unwrap().get(cmd_name) {
-            return Some(ctor(args, engine));
+        if let Some(ctor, args) = EXT_CMDS.read().unwrap().get(cmd_name) {
+            return Some(ctor, args);
         }
 
         None
