@@ -7,6 +7,8 @@ use std::sync::{
     atomic::{Ordering, AtomicBool, AtomicUsize}
 };
 
+use ringbuf::RingBuffer;
+
 use audio_scripting::{CpalDevice, Engine, Track, TrackState, ThreadPool, Command};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -61,8 +63,22 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
 
 fn spawn_worker(cmd: &str, engine: Arc<Engine>) {
     let worker = thread::spawn(move ||
-        if let Some(cmd) = match_cmd(command, engine) {
-            cmd();
+        if let Some(cmd, args) = match_cmd(cmd) {
+            let buffers = &mut engine.buffers;
+            let mut buf_name: &str;
+            let args: Vec<&str> = args.split(' ').collect();
+
+            let maybe_as: Option<&&str> = args.get(1);
+            if maybe_as == "as" {
+                buf_name = args.get(2);
+            } else {
+                buf_name = args.get(0);
+            }
+            
+            let (prod, cons) = RingBuffer::<f32>::new(BUFFER_CAPACITY).split();
+            buffers.write().unwrap().insert(buf_name, Arc::new(Buffer { cons }));
+            // TODO: figure out if a reference to engine is required here
+            cmd(args, engine, prod);
         });
     }
 }
@@ -101,7 +117,7 @@ fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()
             break;
         }
         
-        spawn_worker(command, Arc::clone(&engine));
+        spawn_worker(cmd, Arc::clone(&engine));
     }
 
     Ok(())
@@ -111,14 +127,14 @@ fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()
 fn main() -> anyhow::Result<()> {
     let device = CPAL_init()?;
     println!("Successfully initialized device.");
-
-    let channels = 2;
-    let engine = engine_init(channels)?;
-    println!("Initialized engine.");
-    
+        
     let tracks = load_tracks(device.sample_rate)?; 
     println!("Loaded all tracks.");
     // TODO: integrate tracks into stream_audio
+    let channels = 2;
+    let engine = engine_init(channels, tracks)?;
+    println!("Initialized engine.");
+
     //  stream_audio(engine, device);
 
     Ok(())
