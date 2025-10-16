@@ -1,5 +1,5 @@
 use std::thread;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, 
     RwLock,
@@ -49,15 +49,16 @@ pub mod audio_setup {
         use super::*;
 
         pub struct Engine {
-            pub buffers: HashMap<&'static str, Arc<Buffer>>,
+            pub buffers: HashMap<&'static str, Buffer>,
+            pub tracks: HashMap<&'static str, Track>,
             pub channels: u32,
         }
 
         impl Engine {
-            pub fn new(channels: u32) -> Self {
-                let buffers: HashMap<&'static str, Arc<Buffer>> = HashMap::new();
+            pub fn new(channels: u32, tracks: HashMap<&'static str, Track>) -> Self {
+                let buffers: HashMap<&'static str, Buffer> = HashMap::new();
 
-                Self { buffers, channels }
+                Self { buffers, tracks, channels }
             }
 
             pub fn process(&self, output: &mut [f32]) {
@@ -86,7 +87,7 @@ pub mod audio_setup {
                 }
             }
 
-            pub fn mix_into(&self, output: &mut [f32], channels) {
+            pub fn mix_into(&self, output: &mut [f32], channels: u32) {
                 let mut tmp = [0.0f32; 4096];
                 let n = self.ring.pop_slice(&mut tmp[..output.len() / channels]);
                 for i in 0..n {
@@ -173,7 +174,7 @@ pub mod audio_setup {
                 interleaved
             }
 
-            pub fn new(path: &str, out_rate: usize) -> anyhow::Result<Arc<Self>> {
+            pub fn new(path: &str, out_rate: usize) -> anyhow::Result<Self> {
                 println!("Loading {path}...");
                 // Decode
                 let (mut data, spec) = decode_to_f32(path)?;
@@ -187,13 +188,13 @@ pub mod audio_setup {
                 let total_frames = data.len() / channels;
  
                 println!("Finished loading {path}");
-                Ok(Arc::new(Self { 
+                Ok(Self { 
                     path: path.to_string(), 
                     channels, 
                     data, 
                     total_frames,
                     sample_rate,
-                }))
+                )
             }
         }
 
@@ -203,7 +204,7 @@ pub mod audio_setup {
 // re-export
 pub use crate::audio_setup::{
     device::CpalDevice,
-    engine::{Engine, TrackState},
+    engine::{Engine},
     tracks::Track
 };
 
@@ -319,7 +320,7 @@ pub mod command {
         EXT_CMDS.write().unwrap().insert(name.to_string(), handler);
     }
 
-    pub fn match_cmd(line: &str) -> Option<fn(&str), &str> {
+    pub fn match_cmd(line: &str) -> Option<fn(Arc<Track>, Arc<VecDeque>, Arc<ringbuf::Producer<F32>), &str> {
         let mut parts = line.splitn(2, ' ');
         let cmd_name = parts.next()?;
         let args = parts.next().unwrap_or("");
@@ -335,6 +336,31 @@ pub mod command {
         }
 
         None
+    }
+
+    pub fn Play(track: Arc<Track>, args: VecDeque<&str>, buffer: ringbuf::Producer<F32>) {
+        let samples = &track.samples;
+
+        let end = (start_frame + frame_count).min(samples.len());
+        let chunk = &samples[start_frame..end];
+
+        // feed samples into ring buffer in blocks
+        let mut written = 0;
+        while written < chunk.len() {
+            // non-blocking push
+            let n = prod_ref.push_slice(&chunk[written..]);
+            written += n;
+            if n == 0 {
+                // if full, yield briefly (avoid busy loop)
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else {
+                // mark buffer active once there’s content
+                buf.active.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        // mark inactive when done filling
+        buf.active.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
