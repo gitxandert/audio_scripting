@@ -2,6 +2,7 @@ use std::io;
 use std::thread;
 use std::path::Path;
 use std::fs::{self, DirEntry};
+use std::collections::VecDeque;
 use std::sync::{
     mpsc, Arc, 
     atomic::{Ordering, AtomicBool, AtomicUsize}
@@ -22,11 +23,11 @@ fn CPAL_init() -> anyhow::Result<Arc<CpalDevice>> {
     Ok(cdev)
 }
 
-fn engine_init(channels: u32) -> anyhow::Result<Arc<Engine>> {
-    Ok(Arc::new(Engine::new(channels)))
+fn engine_init(channels: u32, tracks: HashMap<&'static str, Track>) -> anyhow::Result<Arc<Engine>> {
+    Ok(Arc::new(Engine::new(channels, tracks)))
 }
 
-fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
+fn load_tracks(out_rate: usize) -> anyhow::Result<HashMap<&'static str, Track>> {
     // get path strings
     let paths: Vec<String> = fs::read_dir("assets")?
         .map(|res| { 
@@ -36,7 +37,7 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
         .collect::<Result<Vec<_>, _>>()?;
 
     let pool = ThreadPool::build(4)?;
-    let (tx, rx) = mpsc::channel::<anyhow::Result<Arc<Track>>>();
+    let (tx, rx) = mpsc::channel::<anyhow::Result<Track>>();
 
     // multithread file loading
     for path in paths {
@@ -50,10 +51,10 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
     drop(tx);
 
     println!("out_rate = {out_rate}");
-    let mut tracks = Vec::new();
+    let mut tracks = HashMap::new();
     for result in rx {
         match result {
-            Ok(track) => tracks.push(new_track),
+            Ok(track) => tracks.insert(track.path, track); 
             Err(err) => eprintln!("Error loading track: {err}"),
         }
     }
@@ -63,22 +64,27 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<Vec<Arc<Track>>> {
 
 fn spawn_worker(cmd: &str, engine: Arc<Engine>) {
     let worker = thread::spawn(move ||
-        if let Some(cmd, args) = match_cmd(cmd) {
+        if let Some(ctor, args) = match_cmd(cmd) {
             let buffers = &mut engine.buffers;
             let mut buf_name: &str;
-            let args: Vec<&str> = args.split(' ').collect();
+            let args: VecDeque<&str> = args.split(' ').collect();
 
-            let maybe_as: Option<&&str> = args.get(1);
+            let track_name = args.pop_front();
+            let maybe_as: Option<&&str> = args.pop_front();
             if maybe_as == "as" {
-                buf_name = args.get(2);
+                buf_name = args.pop_front();
             } else {
-                buf_name = args.get(0);
+                buf_name = track_name;
+                args.push_front(maybe_as);
             }
+
+            let track = Arc::new(engine.tracks.get(track_name));
             
             let (prod, cons) = RingBuffer::<f32>::new(BUFFER_CAPACITY).split();
             buffers.write().unwrap().insert(buf_name, Arc::new(Buffer { cons }));
-            // TODO: figure out if a reference to engine is required here
-            cmd(args, engine, prod);
+            
+            // each thread responsible for parsing args on its own
+            ctor(track, Arc::new(args), Arc::new(prod));
         });
     }
 }
