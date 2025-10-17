@@ -49,14 +49,14 @@ pub mod audio_setup {
         use super::*;
 
         pub struct Engine {
-            pub buffers: HashMap<&'static str, Buffer>,
-            pub tracks: HashMap<&'static str, Track>,
+            pub buffers: RwLock<HashMap<String, Buffer>>,
+            pub tracks: HashMap<String, Track>,
             pub channels: u32,
         }
 
         impl Engine {
-            pub fn new(channels: u32, tracks: HashMap<&'static str, Track>) -> Self {
-                let buffers: HashMap<&'static str, Buffer> = HashMap::new();
+            pub fn new(channels: u32, tracks: HashMap<String, Track>) -> Self {
+                let buffers: RwLock<HashMap<String, Buffer>> = RwLock::new(HashMap::new());
 
                 Self { buffers, tracks, channels }
             }
@@ -174,9 +174,10 @@ pub mod audio_setup {
                 interleaved
             }
 
-            pub fn new(path: &str, out_rate: usize) -> anyhow::Result<Self> {
+            pub fn new(path: &String, out_rate: usize) -> anyhow::Result<Self> {
                 println!("Loading {path}...");
                 // Decode
+                let path = path.clone();
                 let (mut data, spec) = decode_to_f32(path)?;
                 let channels = spec.channels as usize;
                 let sample_rate = spec.sample_rate as usize;
@@ -189,7 +190,7 @@ pub mod audio_setup {
  
                 println!("Finished loading {path}");
                 Ok(Self { 
-                    path: path.to_string(), 
+                    path, 
                     channels, 
                     data, 
                     total_frames,
@@ -280,7 +281,6 @@ pub use crate::concurrency::threadpool::ThreadPool;
 
 // Commands
 //
-use std::sync::RwLock;
 
 // consistent match statement expansion
 macro_rules! cmd_table {
@@ -303,13 +303,13 @@ macro_rules! cmd_table {
     }};
 }
 
-static CORE_CMDS: fn(&str) -> Option<fn(&str)> = cmd_table! {
+static CORE_CMDS: fn(&str) -> Option<fn(Arc<Track>, VecDeque<&str>, Arc<ringbuf::Producer<f32>>)> = cmd_table! {
     "start" => Engine::Play,
     "stop" => Engine::Stop,
 };
 
 lazy_static::lazy_static! {
-    static ref EXT_CMDS: RwLock<HashMap<String, fn(&str)> = RwLock::new(HashMap::new());
+    static ref EXT_CMDS: RwLock<HashMap<String, fn(Arc<Track>, VecDeque<&str>, Arc<ringbuf::Producer<f32>>)>> = RwLock::new(HashMap::new());
 }
 
 pub mod command {
@@ -320,28 +320,50 @@ pub mod command {
         EXT_CMDS.write().unwrap().insert(name.to_string(), handler);
     }
 
-    pub fn match_cmd(line: &str) -> Option<fn(Arc<Track>, Arc<VecDeque>, Arc<ringbuf::Producer<F32>), &str> {
+    pub fn match_cmd(line: &str) -> Option<fn(Arc<Track>, VecDeque<&str>, Arc<ringbuf::Producer<f32>>), &str> {
         let mut parts = line.splitn(2, ' ');
         let cmd_name = parts.next()?;
         let args = parts.next().unwrap_or("");
 
         // check compile-time core commands first
-        if let Some(ctor, args) = CORE_CMDS(cmd_name) {
-            return Some(ctor, args);
+        if let Some((ctor, args)) = CORE_CMDS(cmd_name) {
+            return Some((ctor, args));
         }
 
         // fall back to dynamically-registered commands
-        if let Some(ctor, args) = EXT_CMDS.read().unwrap().get(cmd_name) {
-            return Some(ctor, args);
+        if let Some((ctor, args)) = EXT_CMDS.read().unwrap().get(cmd_name) {
+            return Some((ctor, args));
         }
 
         None
     }
+    
+    pub fn arg_pop_front(rb: &mut VecDeque<&str>, or_val: usize) -> usize {
+        args.pop_front()
+            .and_then(|a| a.parse::<usize>().ok())
+            .unwrap_or(or_val)
+    }
 
-    pub fn Play(track: Arc<Track>, args: VecDeque<&str>, buffer: ringbuf::Producer<F32>) {
+    pub fn Play(track: Arc<Track>, args: VecDeque<&str>, buf: Arc<ringbuf::Producer<f32>>) {
+        let mut start_frame = 1;
+        let mut frame_count = track.total_frames;
+
+        if args.len() > 0 {
+            &start_frame = args.arg_pop_front(0);
+        }
+
+        if args.len() > 0 {
+            &frame_count = args.arg_pop_front(track.samples.len() - start_frame);
+        }
+
         let samples = &track.samples;
 
-        let end = (start_frame + frame_count).min(samples.len());
+        if start_frame >= samples.len() {
+            eprintln!("start_frame {} out of range", start_frame);
+            return;
+        }
+
+        let end = (start_frame + frame_count).min(track.total_frames);
         let chunk = &samples[start_frame..end];
 
         // feed samples into ring buffer in blocks
