@@ -23,11 +23,11 @@ fn CPAL_init() -> anyhow::Result<Arc<CpalDevice>> {
     Ok(cdev)
 }
 
-fn engine_init(channels: u32, tracks: HashMap<&'static str, Track>) -> anyhow::Result<Arc<Engine>> {
-    Ok(Arc::new(Engine::new(channels, tracks)))
+fn engine_init(channels: u32, tracks: HashMap<String, Track>) -> anyhow::Result<Engine> {
+    Ok(Engine::new(channels, tracks))
 }
 
-fn load_tracks(out_rate: usize) -> anyhow::Result<HashMap<&'static str, Track>> {
+fn load_tracks(out_rate: usize) -> anyhow::Result<HashMap<String, Track>> {
     // get path strings
     let paths: Vec<String> = fs::read_dir("assets")?
         .map(|res| { 
@@ -63,28 +63,40 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<HashMap<&'static str, Track>> 
 }
 
 fn spawn_worker(cmd: &str, engine: Arc<Engine>) {
-    let worker = thread::spawn(move ||
-        if let Some(ctor, args) = match_cmd(cmd) {
-            let buffers = &mut engine.buffers;
-            let mut buf_name: &str;
-            let args: VecDeque<&str> = args.split(' ').collect();
+    let cmd = cmd.to_string();
+    let engine = engine.clone();
 
-            let track_name = args.pop_front();
-            let maybe_as: Option<&&str> = args.pop_front();
-            if maybe_as == "as" {
-                buf_name = args.pop_front();
-            } else {
-                buf_name = track_name;
-                args.push_front(maybe_as);
+    let worker = thread::spawn(move ||
+        if let Some((ctor, args)) = match_cmd(&cmd) {
+            let args: VecDeque<&str> = args.split_whitespace().collect();
+            
+            let track_name = args.pop_front().unwrap_or("");
+            let mut buf_name = track_name.to_string();
+
+            if let Some(next) = args.front() {
+                if *next == "as" {
+                    args.pop_front();
+                    if let Some(name) = args.pop_front() {
+                        buf_name = name.to_string();
+                    }
+                }
             }
 
-            let track = Arc::new(engine.tracks.get(track_name));
+            let track = match engine.tracks.get(track_name) {
+                Some(t) => Arc::new(t.clone()),
+                None => {
+                    eprintln!("Unknown track '{}'", track_name);
+                    return;
+                }
+            };
             
             let (prod, cons) = RingBuffer::<f32>::new(BUFFER_CAPACITY).split();
-            buffers.write().unwrap().insert(buf_name, Arc::new(Buffer { cons }));
-            
+            {
+                let mut buffers = engine.buffers.write().unwrap()
+                buffers.insert(buf_name.clone(), Arc::new(Buffer { cons }));
+            }
             // each thread responsible for parsing args on its own
-            ctor(track, Arc::new(args), Arc::new(prod));
+            ctor(track, args, Arc::new(prod));
         });
     }
 }
@@ -136,7 +148,7 @@ fn main() -> anyhow::Result<()> {
         
     let tracks = load_tracks(device.sample_rate)?; 
     println!("Loaded all tracks.");
-    // TODO: integrate tracks into stream_audio
+    
     let channels = 2;
     let engine = engine_init(channels, tracks)?;
     println!("Initialized engine.");
