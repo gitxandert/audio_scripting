@@ -2,3 +2,6 @@
 *~
 assets/
 *.swp
+
+# my own little script
+*.sh*
