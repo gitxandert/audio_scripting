@@ -1,16 +1,13 @@
-use std::io;
-use std::thread;
+use std::io::{self, Write};
 use std::path::Path;
 use std::fs::{self, DirEntry};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::sync::{
-    mpsc, Arc, 
+    mpsc, Arc, Mutex,
     atomic::{Ordering, AtomicBool, AtomicUsize}
 };
 
-use ringbuf::RingBuffer;
-
-use audio_scripting::{CpalDevice, Engine, Track, TrackState, ThreadPool, Command};
+use audio_scripting::{CpalDevice, Engine, Track, ThreadPool};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -23,7 +20,7 @@ fn CPAL_init() -> anyhow::Result<Arc<CpalDevice>> {
     Ok(cdev)
 }
 
-fn engine_init(channels: u32, tracks: HashMap<String, Track>) -> anyhow::Result<Engine> {
+fn engine_init(channels: usize, tracks: HashMap<String, Track>) -> anyhow::Result<Engine> {
     Ok(Engine::new(channels, tracks))
 }
 
@@ -43,7 +40,7 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<HashMap<String, Track>> {
     for path in paths {
         let tx = tx.clone();
         pool.execute(move || {
-            let track = Track::new(&path, out_size);
+            let track = Track::new(&path, out_rate);
             tx.send(track).unwrap();
         });
     }
@@ -53,55 +50,17 @@ fn load_tracks(out_rate: usize) -> anyhow::Result<HashMap<String, Track>> {
     println!("out_rate = {out_rate}");
     let mut tracks = HashMap::new();
     for result in rx {
-        match result {
-            Ok(track) => tracks.insert(track.path, track); 
-            Err(err) => eprintln!("Error loading track: {err}"),
+        if let track = result.unwrap() {
+            tracks.insert(String::from(&track.path), track);
+        } else {
+            eprintln!("Error opening track");
         }
     }
 
     Ok(tracks)
 }
 
-fn spawn_worker(cmd: &str, engine: Arc<Engine>) {
-    let cmd = cmd.to_string();
-    let engine = engine.clone();
-
-    let worker = thread::spawn(move ||
-        if let Some((ctor, args)) = match_cmd(&cmd) {
-            let args: VecDeque<&str> = args.split_whitespace().collect();
-            
-            let track_name = args.pop_front().unwrap_or("");
-            let mut buf_name = track_name.to_string();
-
-            if let Some(next) = args.front() {
-                if *next == "as" {
-                    args.pop_front();
-                    if let Some(name) = args.pop_front() {
-                        buf_name = name.to_string();
-                    }
-                }
-            }
-
-            let track = match engine.tracks.get(track_name) {
-                Some(t) => Arc::new(t.clone()),
-                None => {
-                    eprintln!("Unknown track '{}'", track_name);
-                    return;
-                }
-            };
-            
-            let (prod, cons) = RingBuffer::<f32>::new(BUFFER_CAPACITY).split();
-            {
-                let mut buffers = engine.buffers.write().unwrap()
-                buffers.insert(buf_name.clone(), Arc::new(Buffer { cons }));
-            }
-            // each thread responsible for parsing args on its own
-            ctor(track, args, Arc::new(prod));
-        });
-    }
-}
-
-fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()> {
+fn stream_audio(engine: Arc<Mutex<Engine>>, cdev: Arc<CpalDevice>) -> anyhow::Result<()> {
     let cfg = cdev.cfg.clone(); 
     let out_ch = cfg.channels as usize;  
 
@@ -111,8 +70,9 @@ fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()
     let stream = cdev.device.build_output_stream::<f32, _, _>(
         &cfg,
         move |data: &mut [f32], _| {
+            let mut engine = engine_cb.lock().unwrap();
             for frame in data.chunks_mut(out_ch) {
-                engine_cb.process(frame);
+                engine.process(frame);
             }
         },
         |err| eprintln!("Stream error: {err}"),
@@ -134,8 +94,8 @@ fn stream_audio(engine: Arc<Engine>, cdev: Arc<CpalDevice>) -> anyhow::Result<()
         if cmd == "quit" {
             break;
         }
-        
-        spawn_worker(cmd, Arc::clone(&engine));
+       
+        Engine::spawn_worker(&engine, cmd);
     }
 
     Ok(())
@@ -153,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     let engine = engine_init(channels, tracks)?;
     println!("Initialized engine.");
 
-    //  stream_audio(engine, device);
+    stream_audio(Arc::new(Mutex::new(engine)), device);
 
     Ok(())
 }
